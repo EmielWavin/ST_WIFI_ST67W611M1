@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: ST_WIFI_ST67W611M1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build gperf ccache dfu-util device-tree-compiler \
+            python3-pip python3-setuptools python3-wheel \
+            gcc-multilib g++-multilib
+
+      - name: Install west
+        run: |
+          pip3 install west
+
+      - name: Initialize Zephyr workspace
+        run: |
+          west init -l ST_WIFI_ST67W611M1
+          west update --narrow -o=--depth=1
+
+      - name: Install Zephyr Python requirements
+        run: |
+          pip3 install -r zephyr/scripts/requirements-base.txt
+
+      - name: Install Zephyr SDK (minimal)
+        run: |
+          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz -C /opt
+          /opt/zephyr-sdk-0.16.8/setup.sh -h
+
+      - name: Build unit tests (native_sim)
+        env:
+          ZEPHYR_TOOLCHAIN_VARIANT: host
+        run: |
+          west build -b native_sim ST_WIFI_ST67W611M1/tests/wifi_driver
+
+      - name: Run unit tests
+        run: |
+          ./build/zephyr/zephyr.exe
+
+  release:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source archive
+        run: git archive --format=zip --output=source-${{ github.ref_name }}.zip HEAD
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ST_WIFI_ST67W611M1 ${{ github.ref_name }}
+          body: |
+            ## ST67W611M1 WiFi NCP Driver Module ${{ github.ref_name }}
+
+            Zephyr west module for the ST67W611M1 WiFi NCP (SPI interface).
+
+            ### Usage
+            Add to your `west.yml`:
+            ```yaml
+            - name: ST_WIFI_ST67W611M1
+              url: https://github.com/EmielWavin/ST_WIFI_ST67W611M1
+              revision: ${{ github.ref_name }}
+              path: modules/lib/st_wifi_st67w611m1
+            ```
+
+            Then enable in `prj.conf`:
+            ```
+            CONFIG_WIFI_ST67W611M1=y
+            ```
+          files: |
+            source-${{ github.ref_name }}.zip

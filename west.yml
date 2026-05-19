@@ -1,0 +1,15 @@
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v3.7.1
+      import:
+        name-allowlist:
+          - cmsis
+
+  self:
+    path: ST_WIFI_ST67W611M1

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+
+description: >
+  ST67W611M1 Wi-Fi NCP module. All control and data traffic travels over a
+  binary-framed SPI bus (T02 host-LwIP profile). The NCP asserts data-ready-gpios
+  when it has data ready for the host to read.
+
+compatible: "st,st67w611m1"
+
+include: spi-device.yaml
+
+properties:
+  data-ready-gpios:
+    type: phandle-array
+    required: true
+    description: >
+      SPI_RDY / DATA_READY pin. NCP asserts this HIGH when it has data
+      ready for the host. Mapped to EXTI for interrupt-driven receive.
+
+  boot-gpios:
+    type: phandle-array
+    description: >
+      BOOT pin. Assert HIGH before power-on to put the NCP into factory
+      UART bootstrap mode (QConn_Flash firmware update). Leave de-asserted
+      for normal operation.
+
+  chip-en-gpios:
+    type: phandle-array
+    description: >
+      CHIP_EN pin. Drive HIGH to enable the module, LOW to power it down.

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config WIFI_ST67W611M1
+	bool "ST67W611M1 Wi-Fi NCP driver"
+	depends on SPI && GPIO
+	help
+	  Enable the ST67W611M1 Wi-Fi NCP driver. This driver communicates
+	  with the NCP over SPI using a binary-framed AT command protocol
+	  (T02 host-LwIP profile). The NCP handles 802.11 while the host
+	  runs the full IP stack.
+
+if WIFI_ST67W611M1
+
+module = WIFI_ST67W611M1
+module-str = wifi_st67w611m1
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # WIFI_ST67W611M1
