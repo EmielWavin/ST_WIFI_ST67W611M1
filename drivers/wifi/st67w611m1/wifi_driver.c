@@ -192,30 +192,25 @@ void wifi_driver_scan_start_refresh(void) {}
 #define RX_THREAD_PRIORITY    K_PRIO_COOP(7)
 
 /*
- * Scan state machine (CWMODE=3, AP+STA dual mode):
+ * Scan architecture (CWMODE=3, AP+STA dual mode):
  *
- * The NCP scans while beaconing.  Switching to CWMODE=1 was attempted but the
- * NCP triggers continuous automatic background re-scans in STA mode, causing
- * unpredictable SPI silence and preventing reliable AP restore.  CWMODE=3 is
- * kept throughout.
+ * The NCP scans while beaconing.  CWMODE=3 is kept throughout (CWMODE=1
+ * triggers unpredictable automatic background re-scans).
  *
-/* Scan procedure (on-demand only):
+ *   KEEPALIVE: A background work item fires AT+CWLAP every 20 s.  Results
+ *              are parsed and cached in scan_results_buf.  The NCP needs
+ *              sustained periodic CWLAP commands to keep its scan database
+ *              populated — a single trigger is not enough.  During warm-up
+ *              (first 5 kicks), the interval is 10 s for faster priming.
  *
- *   TRIGGER: Issue AT+CWLAP.  If the NCP already has fresh internal results
- *            (cache hit), it returns them immediately and we are done.
+ *   ON-DEMAND: wifi_driver_scan_json() reads from the keepalive's cache.
+ *              If the cache is fresh (< 60 s old), results are returned
+ *              immediately.  If stale/empty, it waits up to 45 s for the
+ *              keepalive to populate the cache.  This avoids sending
+ *              competing CWLAPs that interfere with the NCP's scan engine.
  *
- *   WAIT:    Otherwise sleep SCAN_TRIGGER_WAIT_MS.  The NCP hops all channels
- *            in AP+STA mode (returning to the AP channel between hops).
- *            CRITICAL: do NOT send any AT command during this window — it
- *            either errors or restarts the scan.
- *
- *   READ:    Issue AT+CWLAP once more to read whatever the NCP accumulated.
- *            No further retries.
- *
- *   Background refresh has been removed; see wifi_driver_scan_json() / the
- *   note above scan_results_buf for the rationale.  A directed scan is
- *   available via the `neptune wifi scan_ssid` CLI command (see
- *   doc/wifi-west-module/ST67W611M1_scan_issue_report.md).
+ *   DIRECTED:  `neptune wifi scan_ssid` sends a targeted AT+CWLAP with
+ *              SSID/channel filter for connecting to a specific network.
  */
 #define SCAN_MAX_ENTRIES          32
 
@@ -961,6 +956,13 @@ static int wifi_st67_mgmt_scan(const struct device *dev,
 	return 0;
 }
 
+/* Forward declarations for scan keepalive (defined later with scan logic) */
+#define SCAN_KEEPALIVE_INTERVAL_MS  25000  /* every 25s — gives NCP time to scan */
+#define SCAN_KEEPALIVE_INITIAL_MS   20000  /* first kick 20s after AP (post-RST warm-up) */
+static void scan_keepalive_work_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(scan_keepalive_work, scan_keepalive_work_fn);
+static int scan_keepalive_kicks;
+
 static int wifi_st67_mgmt_ap_enable(const struct device *dev,
 				    struct wifi_connect_req_params *params)
 {
@@ -1007,6 +1009,13 @@ static int wifi_st67_mgmt_ap_enable(const struct device *dev,
 
 		data->ap_active = true;
 		net_if_carrier_on(data->iface);
+
+		/* Start scan keepalive — first kick shortly after AP is up
+		 * so the NCP begins building its scan database.  Warm-up
+		 * phase fires more frequently (3 kicks at 15s intervals). */
+		scan_keepalive_kicks = 0;
+		k_work_reschedule(&scan_keepalive_work,
+				  K_MSEC(SCAN_KEEPALIVE_INITIAL_MS));
 	}
 	return ret;
 }
@@ -1022,6 +1031,7 @@ static int wifi_st67_mgmt_ap_disable(const struct device *dev)
 		struct wifi_st67_data *data = dev->data;
 
 		data->ap_active = false;
+		k_work_cancel_delayable(&scan_keepalive_work);
 		if (!data->connected) {
 			net_if_carrier_off(data->iface);
 		}
@@ -1522,25 +1532,99 @@ static void scan_accumulate(const char *resp,
 			    struct scan_result_t *results, int *count, int max);
 
 /* --------------------------------------------------------------------------
- * Scan result buffer — populated on each on-demand scan call.  Not a cache:
- * results are valid only until the next wifi_driver_scan_json() call.
+ * Scan result cache — populated by the keepalive work item.  On-demand scans
+ * read from this cache.  If the cache is stale, the on-demand scan waits for
+ * the keepalive to refresh it rather than sending competing CWLAPs.
  * Protected by scan_mutex.
  * --------------------------------------------------------------------------*/
 static struct scan_result_t scan_results_buf[SCAN_MAX_ENTRIES];
 static int  scan_results_count;
+static int64_t scan_cache_uptime;  /* k_uptime_get() when cache was last filled */
 
-/* Time the host sleeps after triggering a CWLAP scan when the NCP did not
- * already have cached results.  Long enough for one channel sweep in AP+STA
- * mode; chosen empirically.  No retry loop: if the NCP is still busy after
- * this, we return whatever (possibly zero) results it gave us. */
-#define SCAN_TRIGGER_WAIT_MS  15000
+/* Cache is considered fresh if populated within the last 60s */
+#define SCAN_CACHE_MAX_AGE_MS  60000
 
-/* On-demand only.  wifi_driver_scan_start_refresh() is kept as a no-op so
- * existing call sites compile, but no background work is scheduled — the
- * NCP's broadcast scan is expensive and was found to push the NCP into
- * a degraded state when polled aggressively (see doc/wifi-west-module/
- * ST67W611M1_scan_issue_report.md).  Scans now happen only when the user
- * (CLI or WebUI) requests them. */
+/* --------------------------------------------------------------------------
+ * Scan keepalive — periodic background CWLAP that caches results.
+ *
+ * The NCP requires two consecutive AT+CWLAP commands to produce results:
+ * the first triggers an internal scan, the second (after a short delay)
+ * reads the cached results.  This work item fires every 25s and stores
+ * any results in scan_results_buf for on-demand reads.
+ * --------------------------------------------------------------------------*/
+
+static void scan_keepalive_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+	struct wifi_st67_data *data = dev->data;
+
+	if (!data->init_done || !data->ap_active) {
+		return; /* NCP not ready or AP down — don't reschedule */
+	}
+
+	static char keepalive_rsp[2048];
+
+	if (k_mutex_lock(&scan_mutex, K_MSEC(100)) == 0) {
+		/* On the very first kick, re-assert CWMODE=3 to prime the
+		 * NCP's STA scan engine.  Without this the NCP never starts
+		 * scanning in AP+STA mode.  Only done once — repeated CWMODE
+		 * kills in-progress scans. */
+		if (scan_keepalive_kicks == 0) {
+			(void)wifi_st67_at_cmd(dev, "AT+CWMODE=3,0\r\n",
+					       keepalive_rsp,
+					       sizeof(keepalive_rsp));
+			LOG_INF("keepalive: primed STA scan engine (CWMODE=3)");
+		}
+
+		/* Send first CWLAP to trigger a scan cycle in the NCP. */
+		memset(keepalive_rsp, 0, sizeof(keepalive_rsp));
+		(void)wifi_st67_at_cmd(dev, "AT+CWLAP\r\n",
+				       keepalive_rsp,
+				       sizeof(keepalive_rsp));
+
+		/* If the first already returned results, cache them. */
+		if (scan_rsp_has_real_entry(keepalive_rsp)) {
+			scan_results_count = 0;
+			scan_accumulate(keepalive_rsp, scan_results_buf,
+					&scan_results_count,
+					SCAN_MAX_ENTRIES);
+			scan_cache_uptime = k_uptime_get();
+			LOG_INF("keepalive: cached %d networks",
+				scan_results_count);
+		} else {
+			/* Wait for NCP scan to complete, then read results
+			 * with a second CWLAP.  3-5s is enough for NCP to
+			 * return cached results from the trigger above. */
+			k_msleep(3000);
+
+			memset(keepalive_rsp, 0, sizeof(keepalive_rsp));
+			int ret = wifi_st67_at_cmd(dev, "AT+CWLAP\r\n",
+						   keepalive_rsp,
+						   sizeof(keepalive_rsp));
+
+			if ((ret == 0 || ret == -ETIMEDOUT) &&
+			    scan_rsp_has_real_entry(keepalive_rsp)) {
+				scan_results_count = 0;
+				scan_accumulate(keepalive_rsp, scan_results_buf,
+						&scan_results_count,
+						SCAN_MAX_ENTRIES);
+				scan_cache_uptime = k_uptime_get();
+				LOG_INF("keepalive: cached %d networks",
+					scan_results_count);
+			} else {
+				LOG_DBG("keepalive[%d]: no results (ret=%d)",
+					scan_keepalive_kicks, ret);
+			}
+		}
+
+		k_mutex_unlock(&scan_mutex);
+	}
+
+	scan_keepalive_kicks++;
+	k_work_reschedule(&scan_keepalive_work,
+			  K_MSEC(SCAN_KEEPALIVE_INTERVAL_MS));
+}
 
 /* Parse one CWLAP response buffer and merge any new APs into results[].
  * Deduplicates by SSID, keeping the entry with the strongest RSSI. */
@@ -1674,67 +1758,65 @@ int wifi_driver_scan_json(const struct device *dev, char *out, size_t out_len)
 		return -ENODEV;
 	}
 
+	/*
+	 * Cache-first scan strategy:
+	 *
+	 * The keepalive work fires AT+CWLAP every 20s and caches any results
+	 * it finds.  On-demand scans first check the cache.  If the cache is
+	 * fresh, return it immediately (no SPI traffic, no race conditions).
+	 *
+	 * If the cache is empty/stale, release the mutex and wait for the
+	 * keepalive to populate it (up to ~45s).  This avoids sending
+	 * competing CWLAPs that interfere with the NCP's scan engine.
+	 */
+
+	/* Fast path: check if cache is fresh */
 	k_mutex_lock(&scan_mutex, K_FOREVER);
 
-	/*
-	 * On-demand scan only (no background refresh, no time-based cache).
-	 * Procedure:
-	 *   1. Issue AT+CWLAP.  If the NCP already has fresh internal results
-	 *      (cache hit), it returns them immediately and we are done.
-	 *   2. Otherwise the NCP starts an async channel scan.  Sleep for
-	 *      SCAN_TRIGGER_WAIT_MS, then issue AT+CWLAP once more to read
-	 *      whatever the NCP has accumulated.  No further retries.
-	 */
-	scan_results_count = 0;
+	if (scan_results_count > 0 && scan_cache_uptime > 0) {
+		int64_t age = k_uptime_get() - scan_cache_uptime;
 
-	static char rsp[2048];
-	int ret;
-
-	memset(rsp, 0, sizeof(rsp));
-	ret = wifi_st67_at_cmd(d, "AT+CWLAP\r\n", rsp, sizeof(rsp));
-
-	if (ret == 0 && scan_rsp_has_real_entry(rsp)) {
-		LOG_INF("wifi_driver_scan_json: NCP cache hit (%zu bytes)",
-			strlen(rsp));
-		scan_accumulate(rsp, scan_results_buf, &scan_results_count,
-				SCAN_MAX_ENTRIES);
-	} else {
-		LOG_INF("wifi_driver_scan_json: scan triggered, waiting %d ms",
-			SCAN_TRIGGER_WAIT_MS);
-		k_msleep(SCAN_TRIGGER_WAIT_MS);
-
-		memset(rsp, 0, sizeof(rsp));
-		ret = wifi_st67_at_cmd(d, "AT+CWLAP\r\n", rsp, sizeof(rsp));
-
-		if ((ret == 0 || ret == -ETIMEDOUT) &&
-		    scan_rsp_has_real_entry(rsp)) {
-			LOG_INF("wifi_driver_scan_json: read OK (%zu bytes)",
-				strlen(rsp));
-			scan_accumulate(rsp, scan_results_buf,
-					&scan_results_count,
-					SCAN_MAX_ENTRIES);
-		} else {
-			LOG_WRN("wifi_driver_scan_json: scan returned no results (ret=%d)",
-				ret);
+		if (age < SCAN_CACHE_MAX_AGE_MS) {
+			int len = scan_results_to_json(scan_results_buf,
+						       scan_results_count,
+						       out, out_len);
+			LOG_INF("scan_json: cache hit (%d networks, age %d ms)",
+				scan_results_count, (int)age);
+			k_mutex_unlock(&scan_mutex);
+			return len;
 		}
 	}
+	k_mutex_unlock(&scan_mutex);
 
-	if (scan_results_count == 0) {
+	/* Slow path: cache is empty or stale.  Wait for keepalive to
+	 * populate it.  Poll every 5s for up to 45s total. */
+	LOG_INF("scan_json: cache empty/stale, waiting for keepalive...");
+
+	for (int i = 0; i < 9; i++) {
+		k_msleep(5000);
+
+		k_mutex_lock(&scan_mutex, K_FOREVER);
+		if (scan_results_count > 0 && scan_cache_uptime > 0) {
+			int64_t age = k_uptime_get() - scan_cache_uptime;
+
+			if (age < SCAN_CACHE_MAX_AGE_MS) {
+				int len = scan_results_to_json(
+					scan_results_buf,
+					scan_results_count, out, out_len);
+				LOG_INF("scan_json: got %d networks after %d s wait",
+					scan_results_count, (i + 1) * 5);
+				k_mutex_unlock(&scan_mutex);
+				return len;
+			}
+		}
 		k_mutex_unlock(&scan_mutex);
-		return -ETIMEDOUT;
 	}
 
-	int len = scan_results_to_json(scan_results_buf, scan_results_count,
-				       out, out_len);
-	LOG_INF("wifi_driver_scan_json: found %d networks, %d bytes",
-		scan_results_count, len);
-
-	k_mutex_unlock(&scan_mutex);
-	return len;
+	LOG_WRN("scan_json: no results after 45s wait");
+	return -ETIMEDOUT;
 }
 
-/* No-op: background refresh has been removed.  See note above
- * scan_results_buf for rationale. */
+/* Legacy API: now a no-op since keepalive is auto-started by ap_enable. */
 void wifi_driver_scan_start_refresh(void)
 {
 }
