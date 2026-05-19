@@ -748,22 +748,21 @@ static int wifi_st67_mgmt_connect(const struct device *dev,
 	char rsp[AT_RSP_BUF_SIZE];
 
 	/* AT+CWJAP="ssid","password",,0
-	 * Empty BSSID field, WEP=0 (not WEP). WPA2 is auto-negotiated. */
+	 * Empty BSSID field, WEP=0 (not WEP). WPA2 is auto-negotiated.
+	 * Returns immediately with +CW:CONNECTING\r\nOK — actual
+	 * association is async.  Caller must poll wifi_driver_poll_sta_state()
+	 * to determine when connection completes. */
 	snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%.*s\",\"%.*s\",,0\r\n",
 		 params->ssid_length, params->ssid,
 		 params->psk_length, params->psk);
 
 	int ret = wifi_st67_at_cmd(dev, cmd, rsp, sizeof(rsp));
-	if (!ret) {
-		struct wifi_st67_data *data = dev->data;
-
-		data->connected = true;
-		net_if_carrier_on(data->iface);
-		wifi_mgmt_raise_connect_result_event(data->iface, 0);
-	} else {
+	if (ret) {
 		wifi_mgmt_raise_connect_result_event(dev->data ?
 			((struct wifi_st67_data *)dev->data)->iface : NULL, -1);
 	}
+	/* Do NOT set connected=true here — CWJAP is async.
+	 * wifi_driver_poll_sta_state() will report when association succeeds. */
 	return ret;
 }
 
@@ -780,6 +779,43 @@ static int wifi_st67_mgmt_disconnect(const struct device *dev)
 	net_if_carrier_off(data->iface);
 	wifi_mgmt_raise_disconnect_result_event(data->iface, ret ? -1 : 0);
 	return ret;
+}
+
+/* --------------------------------------------------------------------------
+ * wifi_driver_poll_sta_state — query AT+CWSTATE? for async connect result
+ *
+ * Returns:  0 = idle/disconnected
+ *           1 = connecting (in progress)
+ *           2 = connected (got IP)
+ *          <0 = AT command error
+ * --------------------------------------------------------------------------*/
+int wifi_driver_poll_sta_state(void)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+	struct wifi_st67_data *data = dev->data;
+	char rsp[256];
+
+	int ret = wifi_st67_at_cmd(dev, "AT+CWSTATE?\r\n", rsp, sizeof(rsp));
+	if (ret) {
+		return -EIO;
+	}
+
+	/* Response format: +CWSTATE:<state>,"<ssid>"\r\nOK
+	 * state: 0=idle, 1=connecting, 2=connected, 3=disconnecting, 4=disconnected */
+	const char *p = strstr(rsp, "+CWSTATE:");
+	if (!p) {
+		return -EINVAL;
+	}
+	int state = atoi(p + 9);
+
+	if (state == 2 && !data->connected) {
+		data->connected = true;
+		net_if_carrier_on(data->iface);
+		wifi_mgmt_raise_connect_result_event(data->iface, 0);
+		LOG_INF("STA connected (polled)");
+	}
+
+	return state;
 }
 
 /* --------------------------------------------------------------------------
@@ -1569,12 +1605,14 @@ static void scan_keepalive_work_fn(struct k_work *work)
 		/* On the very first kick, re-assert CWMODE=3 to prime the
 		 * NCP's STA scan engine.  Without this the NCP never starts
 		 * scanning in AP+STA mode.  Only done once — repeated CWMODE
-		 * kills in-progress scans. */
+		 * kills in-progress scans.  Sleep 5s to let internal scan
+		 * settle before the first CWLAP. */
 		if (scan_keepalive_kicks == 0) {
 			(void)wifi_st67_at_cmd(dev, "AT+CWMODE=3,0\r\n",
 					       keepalive_rsp,
 					       sizeof(keepalive_rsp));
 			LOG_INF("keepalive: primed STA scan engine (CWMODE=3)");
+			k_msleep(5000);
 		}
 
 		/* Send first CWLAP to trigger a scan cycle in the NCP. */

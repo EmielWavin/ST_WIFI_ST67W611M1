@@ -153,4 +153,14 @@ void wifi_driver_scan_start_refresh(void);
  */
 int wifi_driver_at_cmd(const char *cmd, char *rsp, size_t rsp_len);
 
+/**
+ * @brief Poll STA connection state via AT+CWSTATE?.
+ *
+ * Non-blocking query to determine async CWJAP result.
+ *
+ * @return 0 = idle/disconnected, 1 = connecting, 2 = connected,
+ *         3 = disconnecting, 4 = disconnected, <0 = AT error.
+ */
+int wifi_driver_poll_sta_state(void);
+
 #endif /* WIFI_DRIVER_H */
