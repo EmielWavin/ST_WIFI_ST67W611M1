@@ -112,6 +112,11 @@ bool wifi_driver_is_connected(void)
 	return s_connected;
 }
 
+bool wifi_driver_is_ncp_present(void)
+{
+	return s_init;
+}
+
 struct net_if *wifi_driver_get_iface(void)
 {
 	return NULL;
@@ -1512,6 +1517,17 @@ bool wifi_driver_is_connected(void)
 		return false;
 	}
 	return ((struct wifi_st67_data *)dev->data)->connected;
+}
+
+bool wifi_driver_is_ncp_present(void)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+
+	if (!device_is_ready(dev)) {
+		return false;
+	}
+	const char *ver = ((struct wifi_st67_data *)dev->data)->ncp_version;
+	return (ver[0] != '\0' && strcmp(ver, "unknown") != 0);
 }
 
 struct net_if *wifi_driver_get_iface(void)
