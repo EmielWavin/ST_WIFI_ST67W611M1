@@ -1666,8 +1666,13 @@ static void scan_keepalive_work_fn(struct k_work *work)
 	}
 
 	scan_keepalive_kicks++;
-	k_work_reschedule(&scan_keepalive_work,
-			  K_MSEC(SCAN_KEEPALIVE_INTERVAL_MS));
+
+	/* Only continue periodic scans when AP is active.
+	 * In pure STA mode, scans are on-demand only. */
+	if (data->ap_active) {
+		k_work_reschedule(&scan_keepalive_work,
+				  K_MSEC(SCAN_KEEPALIVE_INTERVAL_MS));
+	}
 }
 
 /* Parse one CWLAP response buffer and merge any new APs into results[].
@@ -1832,8 +1837,52 @@ int wifi_driver_scan_json(const struct device *dev, char *out, size_t out_len)
 	}
 	k_mutex_unlock(&scan_mutex);
 
-	/* Slow path: cache is empty or stale.  Wait for keepalive to
-	 * populate it.  Poll every 5s for up to 45s total. */
+	/* Slow path: cache is empty or stale.  If keepalive is running (AP mode),
+	 * wait for it to populate the cache.  If not (STA mode), do a single
+	 * direct CWLAP attempt for on-demand results. */
+	if (!k_work_delayable_is_pending(&scan_keepalive_work)) {
+		/* Keepalive not running — try a single direct CWLAP */
+		LOG_INF("scan_json: direct scan (keepalive inactive)");
+		static char direct_rsp[2048];
+
+		k_mutex_lock(&scan_mutex, K_FOREVER);
+		memset(direct_rsp, 0, sizeof(direct_rsp));
+		int ret = wifi_st67_at_cmd(d, "AT+CWLAP\r\n",
+					   direct_rsp, sizeof(direct_rsp));
+
+		if ((ret == 0 || ret == -ETIMEDOUT) &&
+		    scan_rsp_has_real_entry(direct_rsp)) {
+			scan_results_count = 0;
+			scan_accumulate(direct_rsp, scan_results_buf,
+					&scan_results_count,
+					SCAN_MAX_ENTRIES);
+			scan_cache_uptime = k_uptime_get();
+			int len = scan_results_to_json(scan_results_buf,
+						       scan_results_count,
+						       out, out_len);
+			LOG_INF("scan_json: direct scan got %d networks",
+				scan_results_count);
+			k_mutex_unlock(&scan_mutex);
+			return len;
+		}
+		k_mutex_unlock(&scan_mutex);
+
+		/* Direct scan failed — return stale cache if any */
+		k_mutex_lock(&scan_mutex, K_FOREVER);
+		if (scan_results_count > 0) {
+			int len = scan_results_to_json(scan_results_buf,
+						       scan_results_count,
+						       out, out_len);
+			LOG_INF("scan_json: returning stale cache (%d networks)",
+				scan_results_count);
+			k_mutex_unlock(&scan_mutex);
+			return len;
+		}
+		k_mutex_unlock(&scan_mutex);
+		LOG_WRN("scan_json: no results available");
+		return -ETIMEDOUT;
+	}
+
 	LOG_INF("scan_json: cache empty/stale, waiting for keepalive...");
 
 	for (int i = 0; i < 9; i++) {
