@@ -1602,19 +1602,18 @@ static void scan_keepalive_work_fn(struct k_work *work)
 	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
 	struct wifi_st67_data *data = dev->data;
 
-	if (!data->init_done || !data->ap_active) {
-		return; /* NCP not ready or AP down — don't reschedule */
+	if (!data->init_done || (!data->ap_active && !data->connected)) {
+		return; /* NCP not ready or neither AP nor STA up */
 	}
 
 	static char keepalive_rsp[2048];
 
 	if (k_mutex_lock(&scan_mutex, K_MSEC(100)) == 0) {
-		/* On the very first kick, re-assert CWMODE=3 to prime the
-		 * NCP's STA scan engine.  Without this the NCP never starts
-		 * scanning in AP+STA mode.  Only done once — repeated CWMODE
-		 * kills in-progress scans.  Sleep 5s to let internal scan
-		 * settle before the first CWLAP. */
-		if (scan_keepalive_kicks == 0) {
+		/* On the very first kick in AP mode, re-assert CWMODE=3 to prime
+		 * the NCP's STA scan engine.  Skip this when in pure STA mode —
+		 * CWLAP works directly in CWMODE=1 and setting CWMODE=3 would
+		 * restart the AP. */
+		if (scan_keepalive_kicks == 0 && data->ap_active) {
 			(void)wifi_st67_at_cmd(dev, "AT+CWMODE=3,0\r\n",
 					       keepalive_rsp,
 					       sizeof(keepalive_rsp));
@@ -1861,9 +1860,14 @@ int wifi_driver_scan_json(const struct device *dev, char *out, size_t out_len)
 	return -ETIMEDOUT;
 }
 
-/* Legacy API: now a no-op since keepalive is auto-started by ap_enable. */
+/* Restart scan keepalive (e.g. after STA connects or AP restarts). */
 void wifi_driver_scan_start_refresh(void)
 {
+#ifndef CONFIG_ZTEST
+	scan_keepalive_kicks = 0;
+	k_work_reschedule(&scan_keepalive_work, K_MSEC(3000));
+	LOG_INF("Scan keepalive restarted");
+#endif
 }
 
 void wifi_driver_scan_stop_refresh(void)
