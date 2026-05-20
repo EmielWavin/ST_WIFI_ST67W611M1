@@ -142,6 +142,14 @@ int wifi_driver_scan_json(const struct device *dev, char *out, size_t out_len);
 void wifi_driver_scan_start_refresh(void);
 
 /**
+ * @brief Stop periodic background scan refresh.
+ *
+ * Should be called before STA connect attempts to avoid SPI contention
+ * between CWLAP and CWJAP.
+ */
+void wifi_driver_scan_stop_refresh(void);
+
+/**
  * @brief Send a raw AT command to the NCP and return the response.
  *
  * Intended for diagnostics only. Appends \r\n if the caller omits it.

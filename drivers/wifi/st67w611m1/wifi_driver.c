@@ -747,6 +747,10 @@ static int wifi_st67_mgmt_connect(const struct device *dev,
 	char cmd[128];
 	char rsp[AT_RSP_BUF_SIZE];
 
+	/* Switch to STA-only mode for association.  The NCP sometimes fails
+	 * to complete WPA2 handshake while AP is simultaneously active. */
+	(void)wifi_st67_at_cmd(dev, "AT+CWMODE=1,0\r\n", rsp, sizeof(rsp));
+
 	/* AT+CWJAP="ssid","password",,0
 	 * Empty BSSID field, WEP=0 (not WEP). WPA2 is auto-negotiated.
 	 * Returns immediately with +CW:CONNECTING\r\nOK — actual
@@ -785,7 +789,7 @@ static int wifi_st67_mgmt_disconnect(const struct device *dev)
  * wifi_driver_poll_sta_state — query AT+CWSTATE? for async connect result
  *
  * Returns:  0 = idle/disconnected
- *           1 = connecting (in progress)
+ *           1 = connected to AP, no IP (L2 up, waiting for DHCP)
  *           2 = connected (got IP)
  *          <0 = AT command error
  * --------------------------------------------------------------------------*/
@@ -801,18 +805,21 @@ int wifi_driver_poll_sta_state(void)
 	}
 
 	/* Response format: +CWSTATE:<state>,"<ssid>"\r\nOK
-	 * state: 0=idle, 1=connecting, 2=connected, 3=disconnecting, 4=disconnected */
+	 * state: 0=idle, 1=connected(no IP), 2=connected(has IP),
+	 *        3=disconnecting, 4=disconnected */
 	const char *p = strstr(rsp, "+CWSTATE:");
 	if (!p) {
 		return -EINVAL;
 	}
 	int state = atoi(p + 9);
 
-	if (state == 2 && !data->connected) {
+	/* State 1 or 2: L2 link is up — signal carrier_on so Zephyr's
+	 * network stack can start DHCP on the WiFi interface. */
+	if ((state == 1 || state == 2) && !data->connected) {
 		data->connected = true;
 		net_if_carrier_on(data->iface);
 		wifi_mgmt_raise_connect_result_event(data->iface, 0);
-		LOG_INF("STA connected (polled)");
+		LOG_INF("STA L2 connected (NCP state=%d)", state);
 	}
 
 	return state;
@@ -1857,6 +1864,14 @@ int wifi_driver_scan_json(const struct device *dev, char *out, size_t out_len)
 /* Legacy API: now a no-op since keepalive is auto-started by ap_enable. */
 void wifi_driver_scan_start_refresh(void)
 {
+}
+
+void wifi_driver_scan_stop_refresh(void)
+{
+#ifndef CONFIG_ZTEST
+	k_work_cancel_delayable(&scan_keepalive_work);
+	LOG_INF("Scan keepalive stopped");
+#endif
 }
 
 /* --------------------------------------------------------------------------
