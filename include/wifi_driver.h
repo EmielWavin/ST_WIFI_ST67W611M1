@@ -171,4 +171,42 @@ int wifi_driver_at_cmd(const char *cmd, char *rsp, size_t rsp_len);
  */
 int wifi_driver_poll_sta_state(void);
 
+/* -----------------------------------------------------------------------
+ * NCP Firmware Update (FWU) over SPI
+ * ----------------------------------------------------------------------- */
+
+/**
+ * @brief Start or stop an NCP firmware update session.
+ *
+ * Sends AT+OTASTART=1 to begin or AT+OTASTART=0 to abort.
+ * Must be called before wifi_driver_fwu_send().
+ *
+ * @param enable  true to start, false to abort/terminate.
+ * @return 0 on success, negative errno on failure.
+ */
+int wifi_driver_fwu_start(bool enable);
+
+/**
+ * @brief Send a firmware chunk to the NCP.
+ *
+ * Sends AT+OTASEND=<len>, waits for '>' prompt, then sends raw binary data.
+ * The first chunk must be a 512-byte OTA header. Subsequent chunks should
+ * be 256-byte aligned for optimal NCP flash writes.
+ *
+ * @param data  Firmware binary chunk.
+ * @param len   Length of chunk in bytes (max SPI_XFER_MAX_PAYLOAD - 32).
+ * @return 0 on success, negative errno on failure.
+ */
+int wifi_driver_fwu_send(const uint8_t *data, size_t len);
+
+/**
+ * @brief Finish FWU and reboot the NCP into new firmware.
+ *
+ * Sends AT+OTAFIN. The NCP will reboot — allow ~5s before re-initialising
+ * the wifi driver.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+int wifi_driver_fwu_finish(void);
+
 #endif /* WIFI_DRIVER_H */
