@@ -152,6 +152,36 @@ int wifi_driver_scan_json(const struct device *dev, char *out, size_t out_len)
 
 void wifi_driver_scan_start_refresh(void) {}
 
+/* FWU simulation */
+static bool  s_fwu_active;
+static size_t s_fwu_bytes_sent;
+
+int wifi_driver_fwu_start(bool enable)
+{
+	s_fwu_active = enable;
+	s_fwu_bytes_sent = 0;
+	return 0;
+}
+
+int wifi_driver_fwu_send(const uint8_t *data, size_t len)
+{
+	ARG_UNUSED(data);
+	if (!s_fwu_active) {
+		return -EPERM;
+	}
+	s_fwu_bytes_sent += len;
+	return 0;
+}
+
+int wifi_driver_fwu_finish(void)
+{
+	if (!s_fwu_active) {
+		return -EPERM;
+	}
+	s_fwu_active = false;
+	return 0;
+}
+
 #else /* CONFIG_ZTEST */
 
 /* =========================================================================
@@ -1509,6 +1539,43 @@ const char *wifi_driver_get_ncp_version(void)
 	return ((struct wifi_st67_data *)dev->data)->ncp_version;
 }
 
+int wifi_driver_refresh_ncp_version(void)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+
+	if (!device_is_ready(dev)) {
+		return -ENODEV;
+	}
+
+	struct wifi_st67_data *data = dev->data;
+	char rsp[AT_RSP_BUF_SIZE];
+
+	int ret = wifi_st67_at_cmd(dev, "AT+GMR\r\n", rsp, sizeof(rsp));
+
+	if (ret) {
+		return ret;
+	}
+
+	const char *tag = "component_version_sdk_";
+	const char *p = strstr(rsp, tag);
+
+	if (!p) {
+		tag = "component_version_macsw_";
+		p = strstr(rsp, tag);
+	}
+	if (p) {
+		p += strlen(tag);
+		size_t i = 0;
+
+		while (*p && *p != '\r' && *p != '\n' && *p != ' ' &&
+		       i < sizeof(data->ncp_version) - 1U) {
+			data->ncp_version[i++] = *p++;
+		}
+		data->ncp_version[i] = '\0';
+	}
+	return 0;
+}
+
 bool wifi_driver_is_connected(void)
 {
 	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
@@ -1972,6 +2039,244 @@ int wifi_driver_at_cmd(const char *cmd, char *rsp, size_t rsp_len)
 	snprintf(buf, sizeof(buf), "%s\r\n", cmd);
 	return wifi_st67_at_cmd(dev, buf, rsp, rsp_len);
 #endif
+}
+
+/* --------------------------------------------------------------------------
+ * NCP Firmware Update (FWU) — AT+OTASTART / AT+OTASEND / AT+OTAFIN
+ * --------------------------------------------------------------------------*/
+
+int wifi_driver_fwu_start(bool enable)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+
+	if (!device_is_ready(dev)) {
+		return -ENODEV;
+	}
+
+	char cmd[32];
+	char rsp[64];
+
+	if (enable) {
+		/* Clear any stale FWU state first (ST SDK pattern) */
+		snprintf(cmd, sizeof(cmd), "AT+OTASTART=0\r\n");
+		(void)wifi_st67_at_cmd(dev, cmd, rsp, sizeof(rsp));
+		k_msleep(100);
+	}
+
+	snprintf(cmd, sizeof(cmd), "AT+OTASTART=%u\r\n", enable ? 1U : 0U);
+	return wifi_st67_at_cmd(dev, cmd, rsp, sizeof(rsp));
+}
+
+/**
+ * Send AT+OTASEND=<len> followed by raw binary data.
+ *
+ * Protocol (from ST SDK W61_AT_Common_RequestSendData):
+ *   1. Send "AT+OTASEND=<len>\r\n" as a normal AT command
+ *   2. NCP responds with ">" when ready to receive binary data
+ *   3. Send raw binary data as a second SPI transaction (type 0)
+ *   4. NCP responds with "Recv <bytes>\r\nOK" when done
+ */
+int wifi_driver_fwu_send(const uint8_t *data, size_t len)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+	struct wifi_st67_data *drv_data = dev->data;
+
+	if (!device_is_ready(dev)) {
+		return -ENODEV;
+	}
+	if (!data || len == 0 || len > SPI_XFER_MAX_PAYLOAD) {
+		return -EINVAL;
+	}
+
+	char cmd[32];
+	uint8_t rx_buf[AT_RSP_BUF_SIZE];
+	uint8_t rx_type;
+	uint16_t rx_len;
+	int ret;
+
+	snprintf(cmd, sizeof(cmd), "AT+OTASEND=%u\r\n", (unsigned int)len);
+
+	k_mutex_lock(&drv_data->spi_lock, K_FOREVER);
+
+	/* Drain stale TXN_RDY */
+	while (k_sem_take(&drv_data->dr_sem, K_NO_WAIT) == 0) {}
+	k_msleep(50);
+
+	/* Phase 1: Send the AT+OTASEND command */
+	ret = spi_transact(dev, SPI_TRAFFIC_AT_CMD,
+			   (const uint8_t *)cmd, (uint16_t)strlen(cmd),
+			   &rx_type, rx_buf, sizeof(rx_buf) - 1U, &rx_len);
+	if (ret) {
+		LOG_ERR("FWU send cmd failed: %d", ret);
+		k_mutex_unlock(&drv_data->spi_lock);
+		return ret;
+	}
+
+	/* Wait for '>' prompt (NCP ready for binary data) */
+	bool got_prompt = false;
+
+	if (rx_len > 0U) {
+		rx_buf[rx_len] = '\0';
+		if (memchr(rx_buf, '>', rx_len)) {
+			got_prompt = true;
+		}
+	}
+
+	if (!got_prompt) {
+		for (int tries = 0; tries < 50; tries++) {
+			bool got_dr = (k_sem_take(&drv_data->dr_sem, K_MSEC(100)) == 0);
+
+			if (!got_dr) {
+				const struct wifi_st67_cfg *cfg = dev->config;
+
+				if (gpio_pin_get_dt(&cfg->data_ready)) {
+					got_dr = true;
+				}
+			}
+			if (!got_dr) {
+				continue;
+			}
+
+			ret = spi_transact(dev, SPI_TRAFFIC_AT_CMD, NULL, 0U,
+					   &rx_type, rx_buf, sizeof(rx_buf) - 1U,
+					   &rx_len);
+			if (ret || rx_len == 0U) {
+				continue;
+			}
+			rx_buf[rx_len] = '\0';
+			if (memchr(rx_buf, '>', rx_len)) {
+				got_prompt = true;
+				break;
+			}
+		}
+	}
+
+	if (!got_prompt) {
+		LOG_ERR("FWU: timeout waiting for '>' prompt");
+		k_mutex_unlock(&drv_data->spi_lock);
+		return -ETIMEDOUT;
+	}
+
+	/* NCP needs time to transition from "sent >" to "ready for binary".
+	 * The ST SDK has natural delay from task switches/queues; we must
+	 * add an explicit pause here (verified by SDK timing analysis). */
+	k_msleep(200);
+
+	/* Phase 2: Send raw binary data.
+	 * Use longer DR timeout (3s) — NCP may take time to assert DR
+	 * after transitioning to binary-receive mode. */
+	{
+		const struct wifi_st67_cfg *cfg = dev->config;
+		const struct gpio_dt_spec *cs = &cfg->bus.config.cs.gpio;
+		struct spi_config no_cs_cfg = cfg->bus.config;
+
+		no_cs_cfg.cs.gpio.port = NULL;
+
+		static uint8_t fwu_tx_frame[SPI_FRAME_HDR_SIZE +
+					    SPI_XFER_MAX_PAYLOAD + 4U];
+		static uint8_t fwu_rx_frame[SPI_FRAME_HDR_SIZE +
+					    SPI_XFER_MAX_PAYLOAD + 4U];
+
+		uint16_t phase1_len = (uint16_t)((SPI_FRAME_HDR_SIZE + len +
+						  3U) & ~3U);
+
+		memset(fwu_tx_frame, 0U, phase1_len);
+		spi_hdr_build(fwu_tx_frame, SPI_TRAFFIC_AT_CMD,
+			      (uint16_t)len);
+		memcpy(fwu_tx_frame + SPI_FRAME_HDR_SIZE, data, len);
+
+		/* Assert CS */
+		(void)gpio_pin_set_dt(cs, 1);
+
+		/* Wait for DR HIGH with extended 3000ms timeout */
+		int64_t deadline = k_uptime_get() + 3000LL;
+
+		while (!gpio_pin_get_dt(&cfg->data_ready) &&
+		       k_uptime_get() < deadline) {
+			k_msleep(1);
+		}
+		if (!gpio_pin_get_dt(&cfg->data_ready)) {
+			(void)gpio_pin_set_dt(cs, 0);
+			LOG_ERR("FWU: DR timeout sending binary data");
+			k_mutex_unlock(&drv_data->spi_lock);
+			return -ETIMEDOUT;
+		}
+
+		/* Phase 1 transfer (header + binary payload) */
+		struct spi_buf tx_b = {.buf = fwu_tx_frame, .len = phase1_len};
+		struct spi_buf rx_b = {.buf = fwu_rx_frame, .len = phase1_len};
+		struct spi_buf_set tx_s = {.buffers = &tx_b, .count = 1};
+		struct spi_buf_set rx_s = {.buffers = &rx_b, .count = 1};
+
+		ret = spi_transceive(cfg->bus.bus, &no_cs_cfg, &tx_s, &rx_s);
+
+		(void)gpio_pin_set_dt(cs, 0);
+
+		if (ret) {
+			LOG_ERR("FWU send data SPI error: %d", ret);
+			k_mutex_unlock(&drv_data->spi_lock);
+			return ret;
+		}
+	}
+
+	/* Wait for "Recv" + OK acknowledgment (up to 10s) */
+	k_msleep(50);
+	for (int tries = 0; tries < 50; tries++) {
+		bool got_dr = (k_sem_take(&drv_data->dr_sem, K_MSEC(200)) == 0);
+
+		if (!got_dr) {
+			const struct wifi_st67_cfg *cfg = dev->config;
+
+			if (gpio_pin_get_dt(&cfg->data_ready)) {
+				got_dr = true;
+			}
+		}
+		if (!got_dr) {
+			continue;
+		}
+
+		ret = spi_transact(dev, SPI_TRAFFIC_AT_CMD, NULL, 0U,
+				   &rx_type, rx_buf, sizeof(rx_buf) - 1U, &rx_len);
+		if (ret || rx_len == 0U) {
+			continue;
+		}
+		rx_buf[rx_len] = '\0';
+		if (strstr((char *)rx_buf, "OK") ||
+		    strstr((char *)rx_buf, "Recv")) {
+			k_mutex_unlock(&drv_data->spi_lock);
+			return 0;
+		}
+		if (strstr((char *)rx_buf, "ERROR")) {
+			LOG_ERR("FWU send: NCP returned ERROR");
+			k_mutex_unlock(&drv_data->spi_lock);
+			return -EIO;
+		}
+	}
+
+	LOG_ERR("FWU send: timeout waiting for Recv/OK");
+	k_mutex_unlock(&drv_data->spi_lock);
+	return -ETIMEDOUT;
+}
+
+int wifi_driver_fwu_finish(void)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+
+	if (!device_is_ready(dev)) {
+		return -ENODEV;
+	}
+
+	char rsp[64];
+
+	/* AT+OTAFIN triggers NCP reboot — response may not arrive */
+	int ret = wifi_st67_at_cmd(dev, "AT+OTAFIN\r\n", rsp, sizeof(rsp));
+
+	/* A timeout is acceptable: NCP reboots and drops SPI */
+	if (ret == -ETIMEDOUT) {
+		LOG_INF("FWU finish: NCP rebooting (timeout expected)");
+		return 0;
+	}
+	return ret;
 }
 
 static const struct net_wifi_mgmt_offload wifi_st67_api = {
